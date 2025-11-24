@@ -160,9 +160,9 @@ class ChatSession:
         except Exception as e:
             print(f"[ChatSession] Warning: could not save history: {e}")
 
-    def add_turn(self, user_query: str, assistant_response: str):
+    def add_turn(self, user_query: str, assistant_response: str, links: List[str] = None):
         self.history.append({"role": "user", "content": user_query})
-        self.history.append({"role": "assistant", "content": assistant_response})
+        self.history.append({"role": "assistant", "content": assistant_response, "links": links or []})
         # Keep history manageable? For now, keep all.
         self.save()
 
@@ -275,21 +275,16 @@ class LocalHeuristicLLM:
         return f"{header}{body} [CITATION:{citation_idx}]"
 
     def generate_chat_reply(self, query: str, final_answer: str, links: List[str]) -> str:
-        """Create a short conversational reply from the final merged answer and links.
-        This is a lightweight fallback used when no external LLM is configured.
+        """Create a conversational reply from the final merged answer.
+        Links are handled separately.
         """
-        # Keep it short: 2-3 sentences plus links
-        # Use the final_answer as the source of truth; extract first 2 sentences.
+        # Keep it detailed: 4-6 sentences
+        # Use the final_answer as the source of truth; extract first 6 sentences.
         parts = re.split(r'(?<=[\.\?!])\s+', final_answer.strip())
-        summary = " ".join(parts[:2]).strip() if parts else final_answer.strip()
+        summary = " ".join(parts[:6]).strip() if parts else final_answer.strip()
         if not summary:
             summary = final_answer.strip()
-        out_lines = ["Hi — here’s a quick summary:", summary]
-        if links:
-            out_lines.append("\nUseful links:")
-            for u in links:
-                out_lines.append(f"- {u}")
-        out_lines.append("\nWant me to expand on any point or show more sources?")
+        out_lines = [summary]
         return "\n".join(out_lines)
 
     def reduce_summarize(self, query: str, notes_with_citations: List[str]) -> str:
@@ -421,19 +416,21 @@ Keep the [CITATION:x] markers in place.
         return self._chat(sys, user).strip()
 
     def generate_chat_reply(self, query: str, final_answer: str, links: List[str]) -> str:
-        """Use the OpenAI chat model to produce a conversational reply that includes the provided links.
-        Falls back to returning the final_answer if the model call fails.
+        """Use the OpenAI chat model to produce a conversational reply.
+        Links are NOT included in the text response.
         """
-        sys = "You are a helpful assistant that writes concise, conversational replies for end users."
+        sys = "You are a helpful assistant that writes detailed, professional replies for end users."
         user = f"""Query: {query}
 
 Final merged answer:
 {final_answer}
 
-Links:
-{chr(10).join(links) if links else '(none)'}
-
-Task: Produce a short (2-3 sentence) conversational reply suitable for a chat UI, and append the links as a bulleted list. Keep it friendly and offer to expand.
+Task: Produce a detailed conversational reply (approx. 4-6 sentences or bullet points) suitable for a chat UI.
+- Include key details from the final answer.
+- Use bullet points if there are multiple distinct points.
+- DO NOT use markdown bolding (no **text**).
+- DO NOT include the links in the text response (they are handled separately).
+- Keep the tone professional and direct (avoid "friendly overview" or "Sure!").
 """
         try:
             out = self._chat(sys, user).strip()
@@ -1060,7 +1057,7 @@ def main() -> None:
         print("\nCollections considered:", ", ".join(result["collections_considered"]))
         
     # Save turn to history
-    session.add_turn(original_query, chat_reply)
+    session.add_turn(original_query, chat_reply, result.get("links", []))
 
 
 if __name__ == "__main__":
