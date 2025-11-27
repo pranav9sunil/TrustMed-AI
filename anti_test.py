@@ -106,11 +106,11 @@ K_HEAD = int(os.environ.get("K_HEAD", "8"))          # quick head search for bud
 K_RECALL = int(os.environ.get("K_RECALL", "200"))    # broad search per agent iteration (more permissive)
 BAND_MAX = int(os.environ.get("BAND_MAX", "120"))    # cap on metadata-vetted candidates per iteration (more permissive)
 
-X0 = float(os.environ.get("X0", "0.68"))             # initial strong threshold (more permissive)
-Y0 = float(os.environ.get("Y0", "0.50"))             # initial band lower bound (more permissive, <= X0)
-T_META0 = float(os.environ.get("T_META0", "0.35"))   # metadata relevance threshold in [0,1]
+X0 = float(os.environ.get("X0", "0.75"))             # initial strong threshold (optimized for quality)
+Y0 = float(os.environ.get("Y0", "0.60"))             # initial band lower bound (optimized, <= X0)
+T_META0 = float(os.environ.get("T_META0", "0.40"))   # metadata relevance threshold in [0,1]
 
-AGENT_MAX_ITERS = int(os.environ.get("AGENT_MAX_ITERS", "3"))
+AGENT_MAX_ITERS = int(os.environ.get("AGENT_MAX_ITERS", "2"))  # Reduced from 3 to 2 for better latency
 BASE_BUDGET_MS = int(os.environ.get("BASE_BUDGET_MS", "2500"))
 MAX_BUDGET_MS = int(os.environ.get("MAX_BUDGET_MS", "12000"))
 MIN_BUDGET_MS = int(os.environ.get("MIN_BUDGET_MS", "2000"))
