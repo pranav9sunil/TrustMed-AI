@@ -42,7 +42,7 @@ from typing import Any, Dict, List, Optional, Tuple, Protocol, Iterable, Set
 
 import chromadb
 from chromadb.config import Settings  # noqa: F401  # for possible extensions
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Load local .env early so environment variables (like OPENAI_API_KEY) are available
@@ -92,10 +92,10 @@ COLLECTION_WHITELIST = os.environ.get("CHROMA_COLLECTIONS")
 if COLLECTION_WHITELIST:
     COLLECTION_WHITELIST = [c.strip() for c in COLLECTION_WHITELIST.split(",") if c.strip()]
 
-EMBEDDING_MODEL_NAME = os.environ.get(
-    "EMBEDDING_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2"
-)
- 
+# Embeddings config
+EMBEDDING_MODEL_NAME = os.environ.get("EMBEDDING_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
+# Alternative medical-domain model: "pritamdeka/S-PubMedBert-MS-MARCO"
+# Or: "medicalai/ClinicalBERT"
 
 # LLM config (optional; will fall back to heuristic LLM if not available)
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
@@ -106,9 +106,9 @@ K_HEAD = int(os.environ.get("K_HEAD", "8"))          # quick head search for bud
 K_RECALL = int(os.environ.get("K_RECALL", "200"))    # broad search per agent iteration (more permissive)
 BAND_MAX = int(os.environ.get("BAND_MAX", "120"))    # cap on metadata-vetted candidates per iteration (more permissive)
 
-X0 = float(os.environ.get("X0", "0.75"))             # initial strong threshold (optimized for quality)
-Y0 = float(os.environ.get("Y0", "0.60"))             # initial band lower bound (optimized, <= X0)
-T_META0 = float(os.environ.get("T_META0", "0.40"))   # metadata relevance threshold in [0,1]
+X0 = float(os.environ.get("X0", "0.65"))             # initial strong threshold (optimized for recall)
+Y0 = float(os.environ.get("Y0", "0.45"))             # initial band lower bound (optimized, <= X0)
+T_META0 = float(os.environ.get("T_META0", "0.35"))   # metadata relevance threshold in [0,1]
 
 AGENT_MAX_ITERS = int(os.environ.get("AGENT_MAX_ITERS", "2"))  # Reduced from 3 to 2 for better latency
 BASE_BUDGET_MS = int(os.environ.get("BASE_BUDGET_MS", "2500"))
@@ -116,6 +116,43 @@ MAX_BUDGET_MS = int(os.environ.get("MAX_BUDGET_MS", "12000"))
 MIN_BUDGET_MS = int(os.environ.get("MIN_BUDGET_MS", "2000"))
 
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "4"))
+
+# Reranking
+RERANKER_MODEL_NAME = os.environ.get("RERANKER_MODEL_NAME", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+RERANKER = None  # Lazy loaded
+
+# Query Expansion
+MEDICAL_EXPANSIONS = {
+    "asthma": "asthma bronchial respiratory inhaler steroid wheezing",
+    "dm": "diabetes mellitus type 1 type 2 insulin glucose sugar",
+    "htn": "hypertension high blood pressure",
+    "cad": "coronary artery disease heart attack myocardial infarction",
+    "mi": "myocardial infarction heart attack",
+    "gerd": "gastroesophageal reflux disease heartburn acid",
+    "copd": "chronic obstructive pulmonary disease lung emphysema bronchitis",
+    "cholesterol": "cholesterol lipid statin hdl ldl",
+    "stroke": "stroke cerebrovascular accident cva clot bleed",
+}
+
+def expand_medical_query(query: str) -> str:
+    """Expand query with related medical terms."""
+    q_lower = query.lower()
+    expanded_terms = []
+    for key, expansion in MEDICAL_EXPANSIONS.items():
+        # Check for whole word match
+        if re.search(r'\b' + re.escape(key) + r'\b', q_lower):
+            expanded_terms.append(expansion)
+    
+    if expanded_terms:
+        # Deduplicate terms that are already in the query
+        new_terms = []
+        for term_str in expanded_terms:
+            for word in term_str.split():
+                if word not in q_lower and word not in new_terms:
+                    new_terms.append(word)
+        if new_terms:
+            return query + " " + " ".join(new_terms)
+    return query
 
 
 def _score_from_collection_metadata(query: str, name: str, meta: Optional[Dict[str, Any]]) -> float:
@@ -453,7 +490,12 @@ Task: Produce one comprehensive answer. Avoid repetition, reconcile overlaps, an
         if not history:
             return query
         
-        sys = "You are a helpful assistant. Your task is to rewrite the last user query to be standalone, resolving any pronouns or references based on the conversation history. Return ONLY the rewritten query. If no rewrite is needed, return the original query."
+        sys = """You are a helpful assistant. Your task is to rewrite the last user query to be standalone.
+RULES:
+1. Resolve pronouns (it, they, that) based on conversation history.
+2. If the user introduces a NEW topic (e.g., asking about "heart disease" after "diabetes"), IGNORE the old topic.
+3. If the user asks a follow-up (e.g., "symptoms?"), attach the MOST RECENT topic.
+Return ONLY the rewritten query. If no rewrite is needed, return the original query."""
         
         # Format history for the prompt
         history_text = ""
@@ -657,6 +699,28 @@ def run_agent_once(
             band_vetted.append(d)
 
     selected = dedupe_docs(strong + band_vetted)
+
+    # Reranking step
+    global RERANKER
+    if RERANKER is None:
+        try:
+            print(f"[Agent:{collection_name}] Loading reranker: {RERANKER_MODEL_NAME}...")
+            RERANKER = CrossEncoder(RERANKER_MODEL_NAME)
+        except Exception as e:
+            print(f"[Agent:{collection_name}] Failed to load reranker: {e}")
+            RERANKER = False
+
+    if RERANKER and selected:
+        try:
+            pairs = [[query_text, d.text] for d in selected]
+            scores = RERANKER.predict(pairs)
+            # Attach scores to docs for debugging/metrics if needed
+            # Sort by score descending
+            scored_docs = sorted(zip(selected, scores), key=lambda x: x[1], reverse=True)
+            # Keep top 10 (or configurable)
+            selected = [d for d, s in scored_docs[:10]]
+        except Exception as e:
+            print(f"[Agent:{collection_name}] Reranking failed: {e}")
 
     # summarize
     summary, citations, conf = summarize_verbose(llm, query_text, selected)
@@ -916,13 +980,19 @@ def orchestrate(query_text: str,
     except Exception:
         pass
 
-    # Embed query
-    q_vec = embedder.encode([query_text])[0]
+    # Expand query for better retrieval
+    expanded_query = expand_medical_query(query_text)
+    if expanded_query != query_text:
+        print(f"[Orchestrator] Expanded query: '{query_text}' -> '{expanded_query}'")
 
-    # Run agents in parallel
+    # Embed query (use expanded)
+    q_vec = embedder.encode([expanded_query])[0]
+
+    # Run agents in parallel (pass expanded query for metadata scoring/reranking, but original could be used for generation if needed)
+    # For now, passing expanded query everywhere to help agents focus
     outputs: List[AgentOutput] = []
     with ThreadPoolExecutor(max_workers=min(max_workers, len(named))) as pool:
-        futures = {pool.submit(agent_loop, c, n, query_text, q_vec, llm): n for (n, c) in named}
+        futures = {pool.submit(agent_loop, c, n, expanded_query, q_vec, llm): n for (n, c) in named}
         for fut in as_completed(futures):
             name = futures[fut]
             try:
