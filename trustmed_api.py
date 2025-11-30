@@ -15,7 +15,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 # Import our enhanced medical AI system
-from anti_test import orchestrate, build_llm_provider, SentenceTransformerEmbeddings, ChatSession
+from anti_test import (
+    orchestrate,
+    build_llm_provider,
+    SentenceTransformerEmbeddings,
+    ChatSession,
+)
 import chromadb
 
 # Initialize FastAPI app
@@ -57,7 +62,10 @@ class MedicalQuery(BaseModel):
 class MedicalLink(BaseModel):
     title: str = Field(..., description="Resource title")
     url: str = Field(..., description="Resource URL")
-    source_type: str = Field(default="general", description="Source type: medicine, symptoms, diseases, or general")
+    source_type: str = Field(
+        default="general",
+        description="Source type: medicine, symptoms, diseases, or general",
+    )
     relevance_score: float = Field(default=0.0, description="Relevance score")
 
 
@@ -571,17 +579,21 @@ async def process_medical_query(query_data: MedicalQuery):
     try:
         # Get conversation history
         history = chat_session.get_history()
-        
-        # Contextualize query if we have history
+
+        # Contextualize query (always, like CLI does)
         original_query = query_data.query
         contextualized_query = original_query
         
-        if history:
-            try:
-                contextualized_query = llm_provider.contextualize_query(original_query, history)
-            except Exception:
-                contextualized_query = original_query
-        
+        try:
+            contextualized_query = llm_provider.contextualize_query(
+                original_query, history
+            )
+            if contextualized_query != original_query:
+                print(f"[Context] Rewrote query: '{original_query}' -> '{contextualized_query}'")
+        except Exception as e:
+            print(f"[Context] Failed to contextualize query: {e}")
+            contextualized_query = original_query
+
         # Process query with anti_test.py orchestration
         result = orchestrate(
             query_text=contextualized_query,
@@ -591,11 +603,29 @@ async def process_medical_query(query_data: MedicalQuery):
             collections_filter=None,
             max_workers=4,
         )
-
-        # Extract data from orchestrate result
-        answer = result.get("answer", "")
-        links = result.get("links", [])  # List[str] of URLs
+        print(f"Orchestration result: {result}")
         
+        # Generate clean answer like CLI does
+        try:
+            # Use LLM to generate clean conversational reply without citations
+            clean_answer = llm_provider.generate_chat_reply(
+                original_query, 
+                result.get("answer", ""), 
+                result.get("links", [])
+            )
+        except Exception as e:
+            print(f"[Warning] Failed to generate chat reply: {e}")
+            # Fallback: use raw answer but remove citation markers
+            clean_answer = result.get("answer", "")
+            # Remove citation markers like [A1], [A2], etc.
+            import re
+            clean_answer = re.sub(r'\[A\d+\]', '', clean_answer)
+            clean_answer = re.sub(r'\s+', ' ', clean_answer).strip()
+        
+        # Extract data from orchestrate result
+        answer = clean_answer
+        links = result.get("links", [])  # List[str] of URLs
+
         # Convert links (URLs) to MedicalLink format
         medical_links = []
         for url in links:
@@ -605,22 +635,28 @@ async def process_medical_query(query_data: MedicalQuery):
                 title = url.split("/")[-1].replace("-", " ").replace("_", " ").title()
                 if not title or title == "":
                     title = "Medical Resource"
-                
+
                 # Determine source type from URL patterns
                 source_type = "general"
-                if any(term in url.lower() for term in ["medicine", "drug", "patient.info"]):
+                if any(
+                    term in url.lower() for term in ["medicine", "drug", "patient.info"]
+                ):
                     source_type = "medicine"
                 elif any(term in url.lower() for term in ["symptom", "signs"]):
                     source_type = "symptoms"
-                elif any(term in url.lower() for term in ["disease", "condition", "disorder"]):
+                elif any(
+                    term in url.lower() for term in ["disease", "condition", "disorder"]
+                ):
                     source_type = "diseases"
-                
-                medical_links.append(MedicalLink(
-                    title=title,
-                    url=url,
-                    source_type=source_type,
-                    relevance_score=0.8  # Default score since we don't have individual scores
-                ))
+
+                medical_links.append(
+                    MedicalLink(
+                        title=title,
+                        url=url,
+                        source_type=source_type,
+                        relevance_score=0.8,  # Default score since we don't have individual scores
+                    )
+                )
 
         # Calculate metrics
         total_docs = sum(
@@ -635,7 +671,7 @@ async def process_medical_query(query_data: MedicalQuery):
 
         response_time_ms = int((time.time() - start_time) * 1000)
         query_intent = detect_query_intent(query_data.query)
-        
+
         # Save conversation turn to chat_history.json
         try:
             chat_session.add_turn(original_query, answer, links)
